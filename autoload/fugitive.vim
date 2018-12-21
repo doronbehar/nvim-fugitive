@@ -107,6 +107,19 @@ function! s:cpath(path, ...) abort
   return a:0 ? path ==# s:cpath(a:1) : path
 endfunction
 
+function! s:Cd(...) abort
+  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : exists(':tcd') && haslocaldir(-1) ? 'tcd' : 'cd'
+  if !a:0
+    return cd
+  endif
+  let cwd = getcwd()
+  if s:cpath(cwd, a:1)
+    return ''
+  endif
+  exe cd s:fnameescape(a:1)
+  return cd . ' ' . s:fnameescape(cwd)
+endfunction
+
 let s:executables = {}
 
 function! s:executable(binary) abort
@@ -314,10 +327,48 @@ function! fugitive#RevParse(rev, ...) abort
   call s:throw('rev-parse '.a:rev.': '.hash)
 endfunction
 
-function! fugitive#Config(name, ...) abort
-  let cmd = fugitive#Prepare(a:0 ? a:1 : get(b:, 'git_dir', ''), '--no-literal-pathspecs', 'config', '--get', '--', a:name)
-  let out = matchstr(system(cmd), "[^\n]*")
-  return v:shell_error ? '' : out
+function! s:ConfigTimestamps(dir, dict) abort
+  let files = ['/etc/gitconfig', '~/.gitconfig',
+        \ len($XDG_CONFIG_HOME) ? $XDG_CONFIG_HOME . '/git/config' : '~/.config/git/config']
+  if len(a:dir)
+    call add(files, fugitive#Find('.git/config', a:dir))
+  endif
+  call extend(files, get(a:dict, 'include.path', []))
+  return join(map(files, 'getftime(expand(v:val))'), ',')
+endfunction
+
+let s:config = {}
+function! fugitive#Config(...) abort
+  let dir = get(b:, 'git_dir', '')
+  let name = ''
+  if len(a:000) >= 2
+    let dir = a:000[1]
+    let name = a:000[0]
+  elseif len(a:000) == 1 && a:000[0] =~# '^[[:alnum:]-]\+\.'
+    let name = a:000[0]
+  elseif len(a:000) == 1
+    let dir = a:000[0]
+  endif
+  let key = len(dir) ? dir : '_'
+  if has_key(s:config, key) && s:config[key][0] ==# s:ConfigTimestamps(dir, s:config[key][1])
+    let dict = s:config[key][1]
+  else
+    let dict = {}
+    let lines = split(system(FugitivePrepare(['config', '--list', '-z'], dir)), "\1")
+    if v:shell_error
+      return {}
+    endif
+    for line in lines
+      let key = matchstr(line, "^[^\n]*")
+      if !has_key(dict, key)
+        let dict[key] = []
+      endif
+      call add(dict[key], strpart(line, len(key) + 1))
+    endfor
+    let s:config[dir] = [s:ConfigTimestamps(dir, dict), dict]
+    lockvar! dict
+  endif
+  return len(name) ? get(get(dict, name, []), 0, '') : dict
 endfunction
 
 function! s:Remote(dir) abort
@@ -430,13 +481,11 @@ function! s:repo_git_chomp(...) dict abort
 endfunction
 
 function! s:repo_git_chomp_in_tree(...) dict abort
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let dir = getcwd()
+  let cdback = s:Cd(self.tree())
   try
-    execute cd s:fnameescape(self.tree())
     return call(self.git_chomp, a:000, self)
   finally
-    execute cd s:fnameescape(dir)
+    execute cdback
   endtry
 endfunction
 
@@ -1358,6 +1407,10 @@ function! fugitive#BufReadStatus() abort
     nnoremap <buffer> <silent> <C-P> :<C-U>execute <SID>StagePrevious(v:count1)<CR>
     exe "nnoremap <buffer> <silent>" nowait "- :<C-U>silent execute <SID>StageToggle(line('.'),line('.')+v:count1-1)<CR>"
     exe "xnoremap <buffer> <silent>" nowait "- :<C-U>silent execute <SID>StageToggle(line(\"'<\"),line(\"'>\"))<CR>"
+    exe "nnoremap <buffer> <silent>" nowait "s :<C-U>silent execute <SID>StageToggle(line('.'),line('.')+v:count1-1)<CR>"
+    exe "xnoremap <buffer> <silent>" nowait "s :<C-U>silent execute <SID>StageToggle(line(\"'<\"),line(\"'>\"))<CR>"
+    exe "nnoremap <buffer> <silent>" nowait "u :<C-U>silent execute <SID>StageToggle(line('.'),line('.')+v:count1-1)<CR>"
+    exe "xnoremap <buffer> <silent>" nowait "u :<C-U>silent execute <SID>StageToggle(line(\"'<\"),line(\"'>\"))<CR>"
     nnoremap <buffer> <silent> a :<C-U>let b:fugitive_display_format += 1<Bar>exe fugitive#BufReadStatus()<CR>
     nnoremap <buffer> <silent> i :<C-U>let b:fugitive_display_format -= 1<Bar>exe fugitive#BufReadStatus()<CR>
     nnoremap <buffer> <silent> C :<C-U>Gcommit<CR>:echohl WarningMsg<Bar>echo ':Gstatus C is deprecated in favor of cc'<Bar>echohl NONE<CR>
@@ -1630,7 +1683,7 @@ function! s:Git(bang, mods, args) abort
   else
     let cmd = "exe '!'.escape(" . string(git) . " . ' ' . s:ShellExpand(" . string(args) . "),'!#%')"
     if s:cpath(tree) !=# s:cpath(getcwd())
-      let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
+      let cd = s:Cd()
       let cmd = 'try|' . cd . ' ' . tree . '|' . cmd . '|finally|' . cd . ' ' . s:fnameescape(getcwd()) . '|endtry'
     endif
     return cmd . after
@@ -1748,7 +1801,7 @@ function! fugitive#reload_status() abort
   return fugitive#ReloadStatus()
 endfunction
 
-function! s:stage_info(lnum) abort
+function! s:StageFileSection(lnum) abort
   let filename = matchstr(getline(a:lnum),'^.\=\t\zs.\{-\}\ze\%( ([^()[:digit:]]\+)\)\=$')
   let lnum = a:lnum
   if has('multi_byte_encoding')
@@ -1794,18 +1847,21 @@ endfunction
 
 function! s:StageReloadSeek(target,lnum1,lnum2) abort
   let jump = a:target
-  let f = matchstr(getline(a:lnum1-1),'^.\=\t\%([[:alpha:] ]\+: *\|.*\%uff1a *\)\=\zs.*')
-  if f !=# '' | let jump = f | endif
-  let f = matchstr(getline(a:lnum2+1),'^.\=\t\%([[:alpha:] ]\+: *\|.*\%uff1a *\)\=\zs.*')
-  if f !=# '' | let jump = f | endif
+  let target = s:StageFileSection(a:lnum2 + 1)
+  if empty(target[0])
+    let target = s:StageFileSection(a:lnum1 - 1)
+  endif
+  if empty(target[0])
+    let target = a:target
+  endif
   silent! edit!
   1
   redraw
-  call search('^.\=\t\%([[:alpha:] ]\+: *\|.*\%uff1a *\)\=\V'.jump.'\%( ([^()[:digit:]]\+)\)\=\$','W')
+  call search('^.\=\t\%([[:alpha:] ]\+: *\|.*\%uff1a *\)\=\V'.target[0].'\%( ([^()[:digit:]]\+)\)\=\$','W')
 endfunction
 
 function! s:StageUndo() abort
-  let [filename, section] = s:stage_info(line('.'))
+  let [filename, section] = s:StageFileSection(line('.'))
   if empty(filename)
     return ''
   endif
@@ -1820,7 +1876,7 @@ function! s:StageUndo() abort
     else
       call s:TreeChomp('checkout', 'HEAD^{}', './' . filename)
     endif
-    call s:StageReloadSeek(filename, line('.'), line('.'))
+    call s:StageReloadSeek([filename, ''], line('.'), line('.'))
     let @" = hash
     return 'checktime|redraw|echomsg ' .
           \ string('To restore, :Git cat-file blob '.hash[0:6].' > '.filename)
@@ -1828,7 +1884,7 @@ function! s:StageUndo() abort
 endfunction
 
 function! s:StageDiff(diff) abort
-  let [filename, section] = s:stage_info(line('.'))
+  let [filename, section] = s:StageFileSection(line('.'))
   if filename ==# '' && section ==# 'staged'
     return 'Git! diff --no-ext-diff --cached'
   elseif filename ==# ''
@@ -1841,13 +1897,13 @@ function! s:StageDiff(diff) abort
     execute 'Gedit '.s:fnameescape(':0:'.filename)
     return a:diff.' -'
   else
-    execute 'Gedit '.s:fnameescape('/'.filename)
+    execute 'Gedit '.s:fnameescape(':(top)'.filename)
     return a:diff
   endif
 endfunction
 
 function! s:StageDiffEdit() abort
-  let [filename, section] = s:stage_info(line('.'))
+  let [filename, section] = s:StageFileSection(line('.'))
   let arg = (filename ==# '' ? '.' : filename)
   if section ==# 'staged'
     return 'Git! diff --no-ext-diff --cached '.s:shellesc(arg)
@@ -1860,7 +1916,7 @@ function! s:StageDiffEdit() abort
         call search(':$','W')
       endif
     else
-      call s:StageReloadSeek(arg,line('.'),line('.'))
+      call s:StageReloadSeek([filename, 'staged'], line('.'), line('.'))
     endif
     return ''
   else
@@ -1875,7 +1931,7 @@ function! s:StageToggle(lnum1,lnum2) abort
   try
     let output = ''
     for lnum in range(a:lnum1,a:lnum2)
-      let [filename, section] = s:stage_info(lnum)
+      let [filename, section] = s:StageFileSection(lnum)
       if getline('.') =~# ':$'
         if section ==# 'staged'
           call s:TreeChomp('reset','-q')
@@ -1916,13 +1972,13 @@ function! s:StageToggle(lnum1,lnum2) abort
       else
         let cmd = ['add','-A', './' . filename]
       endif
-      if !exists('first_filename')
-        let first_filename = filename
+      if !exists('target')
+        let target = [filename, section ==# 'staged' ? '' : 'staged']
       endif
       let output .= call('s:TreeChomp', cmd)."\n"
     endfor
-    if exists('first_filename')
-      call s:StageReloadSeek(first_filename,a:lnum1,a:lnum2)
+    if exists('target')
+      call s:StageReloadSeek(target, a:lnum1, a:lnum2)
     endif
     echo s:sub(s:gsub(output,'\n+','\n'),'\n$','')
   catch /^fugitive:/
@@ -1936,7 +1992,7 @@ function! s:StagePatch(lnum1,lnum2) abort
   let reset = []
 
   for lnum in range(a:lnum1,a:lnum2)
-    let [filename, section] = s:stage_info(lnum)
+    let [filename, section] = s:StageFileSection(lnum)
     if getline('.') =~# ':$' && section ==# 'staged'
       return 'Git reset --patch'
     elseif getline('.') =~# ':$' && section ==# 'unstaged'
@@ -1985,8 +2041,6 @@ function! s:Commit(mods, args, ...) abort
   let mods = s:gsub(a:mods ==# '<mods>' ? '' : a:mods, '<tab>', '-tab')
   let dir = a:0 ? a:1 : b:git_dir
   let tree = s:Tree(dir)
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let cwd = getcwd()
   let msgfile = dir . '/COMMIT_EDITMSG'
   let outfile = tempname()
   let errorfile = tempname()
@@ -1996,7 +2050,7 @@ function! s:Commit(mods, args, ...) abort
       if &guioptions =~# '!'
         setglobal guioptions-=!
       endif
-      execute cd s:fnameescape(tree)
+      let cdback = s:Cd(tree)
       if s:winshell()
         let command = ''
         let old_editor = $GIT_EDITOR
@@ -2015,7 +2069,7 @@ function! s:Commit(mods, args, ...) abort
       endif
       let error = v:shell_error
     finally
-      execute cd s:fnameescape(cwd)
+      execute cdback
       let &guioptions = guioptions
     endtry
     if !has('gui_running')
@@ -2027,6 +2081,7 @@ function! s:Commit(mods, args, ...) abort
           echo line
         endfor
       endif
+      call fugitive#ReloadStatus()
       return ''
     else
       let errors = readfile(errorfile)
@@ -2034,8 +2089,6 @@ function! s:Commit(mods, args, ...) abort
       if error =~# 'false''\=\.$'
         let args = s:gsub(args,'%(%(^| )-- )@<!%(^| )@<=%(-[esp]|--edit|--interactive|--patch|--signoff)%($| )','')
         let args = s:gsub(args,'%(%(^| )-- )@<!%(^| )@<=%(-c|--reedit-message|--reuse-message|-F|--file|-m|--message)%(\s+|\=)%(''[^'']*''|"%(\\.|[^"])*"|\\.|\S)*','')
-        let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-        let cwd = getcwd()
         let args = s:sub(args, '\ze -- |$', ' --no-edit --no-interactive --no-signoff')
         let args = '-F '.s:shellesc(msgfile).' '.args
         if args !~# '\%(^\| \)--cleanup\>'
@@ -2056,7 +2109,8 @@ function! s:Commit(mods, args, ...) abort
         setlocal bufhidden=wipe filetype=gitcommit
         return '1'
       elseif error ==# '!'
-        return 'Gstatus'
+        echo get(readfile(outfile), -1, '')
+        return ''
       else
         call s:throw(empty(error)?join(errors, ' '):error)
       endif
@@ -2069,7 +2123,6 @@ function! s:Commit(mods, args, ...) abort
     endif
     call delete(outfile)
     call delete(errorfile)
-    call fugitive#ReloadStatus()
   endtry
 endfunction
 
@@ -2147,11 +2200,10 @@ function! s:Merge(cmd, bang, args) abort
   if a:cmd =~# '^rebase' && ' '.a:args =~# ' -i\| --interactive\| --edit-todo'
     return 'echoerr "git rebase --interactive not supported"'
   endif
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let cwd = getcwd()
   let [mp, efm] = [&l:mp, &l:efm]
   let had_merge_msg = filereadable(b:git_dir . '/MERGE_MSG')
   try
+    let cdback = s:Cd(s:Tree())
     let &l:errorformat = ''
           \ . '%-Gerror:%.%#false''.,'
           \ . '%-G%.%# ''git commit'' %.%#,'
@@ -2187,7 +2239,6 @@ function! s:Merge(cmd, bang, args) abort
     else
       let &l:makeprg = 'env GIT_EDITOR=false ' . &l:makeprg
     endif
-    execute cd fnameescape(s:Tree())
     silent noautocmd make!
   catch /^Vim\%((\a\+)\)\=:E211/
     let err = v:exception
@@ -2197,7 +2248,7 @@ function! s:Merge(cmd, bang, args) abort
     if exists('old_editor')
       let $GIT_EDITOR = old_editor
     endif
-    execute cd fnameescape(cwd)
+    execute cdback
   endtry
   call fugitive#ReloadStatus()
   if empty(filter(getqflist(),'v:val.valid'))
@@ -2246,10 +2297,8 @@ call s:command("-bar -bang -nargs=* -range=-1 -complete=customlist,s:GrepComplet
 function! s:Grep(cmd,bang,arg) abort
   let grepprg = &grepprg
   let grepformat = &grepformat
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let dir = getcwd()
   try
-    execute cd s:fnameescape(s:Tree())
+    let cdback = s:Cd(s:Tree())
     let &grepprg = s:UserCommand() . ' --no-pager grep -n --no-color'
     let &grepformat = '%f:%l:%m,%m %f match%ts,%f'
     exe a:cmd.'! '.escape(s:ShellExpand(matchstr(a:arg, '\v\C.{-}%($|[''" ]\@=\|)@=')), '|#%')
@@ -2278,7 +2327,7 @@ function! s:Grep(cmd,bang,arg) abort
   finally
     let &grepprg = grepprg
     let &grepformat = grepformat
-    execute cd s:fnameescape(dir)
+    execute cdback
   endtry
 endfunction
 
@@ -2307,10 +2356,8 @@ function! s:Log(cmd, bang, line1, line2, ...) abort
   endif
   let grepformat = &grepformat
   let grepprg = &grepprg
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let dir = getcwd()
   try
-    execute cd s:fnameescape(s:Tree())
+    let cdback = s:Cd(s:Tree())
     let &grepprg = escape(s:UserCommand() . ' --no-pager log --no-color ' .
           \ s:shellesc('--pretty=format:fugitive://'.b:git_dir.'//%H'.path.'::'.g:fugitive_summary_format), '%#')
     let &grepformat = '%Cdiff %.%#,%C--- %.%#,%C+++ %.%#,%Z@@ -%\d%\+\,%\d%\+ +%l\,%\d%\+ @@,%-G-%.%#,%-G+%.%#,%-G %.%#,%A%f::%m,%-G%.%#'
@@ -2318,7 +2365,7 @@ function! s:Log(cmd, bang, line1, line2, ...) abort
   finally
     let &grepformat = grepformat
     let &grepprg = grepprg
-    execute cd s:fnameescape(dir)
+    execute cdback
   endtry
 endfunction
 
@@ -2379,16 +2426,14 @@ function! s:Edit(cmd, bang, mods, args, ...) abort
 
   if a:bang
     let temp = tempname()
-    let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-    let cwd = getcwd()
     try
-      execute cd s:fnameescape(s:Tree())
+      let cdback = s:Cd(s:Tree())
       let git = s:UserCommand()
       let args = s:ShellExpand(a:args)
       silent! execute '!' . escape(git . ' --no-pager ' . args, '!#%') .
             \ (&shell =~# 'csh' ? ' >& ' . temp : ' > ' . temp . ' 2>&1')
     finally
-      execute cd s:fnameescape(cwd)
+      execute cdback
     endtry
     let temp = s:Resolve(temp)
     let s:temp_files[s:cpath(temp)] = { 'dir': b:git_dir, 'filetype': 'git' }
@@ -2427,15 +2472,13 @@ function! s:Read(count, line1, line2, range, bang, mods, args, ...) abort
     let delete = ''
   endif
   if a:bang
-    let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-    let cwd = getcwd()
     try
-      execute cd s:fnameescape(s:Tree())
+      let cdback = s:Cd(s:Tree())
       let git = s:UserCommand()
       let args = s:ShellExpand(a:args)
       silent execute mods after.'read!' escape(git . ' --no-pager ' . args, '!#%')
     finally
-      execute cd s:fnameescape(cwd)
+      execute cdback
     endtry
     execute delete . 'diffupdate'
     call fugitive#ReloadStatus()
@@ -2639,13 +2682,11 @@ call s:command("-nargs=? -bang -complete=custom,s:RemoteComplete Gpush  execute 
 call s:command("-nargs=? -bang -complete=custom,s:RemoteComplete Gfetch execute s:Dispatch('<bang>', 'fetch '.<q-args>)")
 
 function! s:Dispatch(bang, args)
-  let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
-  let cwd = getcwd()
   let [mp, efm, cc] = [&l:mp, &l:efm, get(b:, 'current_compiler', '')]
   try
+    let cdback = s:Cd(s:Tree())
     let b:current_compiler = 'git'
     let &l:errorformat = s:common_efm
-    execute cd fnameescape(s:Tree())
     let &l:makeprg = substitute(s:UserCommand() . ' ' . a:args, '\s\+$', '', '')
     if exists(':Make') == 2
       noautocmd Make
@@ -2690,7 +2731,7 @@ function! s:Dispatch(bang, args)
   finally
     let [&l:mp, &l:efm, b:current_compiler] = [mp, efm, cc]
     if empty(cc) | unlet! b:current_compiler | endif
-    execute cd fnameescape(cwd)
+    execute cdback
   endtry
 endfunction
 
@@ -3035,8 +3076,9 @@ function! s:Blame(bang, line1, line2, count, mods, args) abort
     let cmd += ['--', expand('%:p')]
     let basecmd = escape(fugitive#Prepare(cmd), '!#%')
     try
-      let cd = exists('*haslocaldir') && haslocaldir() ? 'lcd' : 'cd'
+      let cd = s:Cd()
       let tree = s:Tree()
+      let cdback = s:Cd(tree)
       if len(tree) && s:cpath(tree) !=# s:cpath(getcwd())
         let cwd = getcwd()
         execute cd s:fnameescape(tree)
