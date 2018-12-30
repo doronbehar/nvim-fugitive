@@ -73,10 +73,10 @@ function! FugitivePrepare(...) abort
 endfunction
 
 function! FugitiveConfig(...) abort
-  if len(a:000) == 2
-    return fugitive#Config(a:000[1], FugitiveGitDir(a:000[2]))
-  elseif len(a:000) == 1 && a:000[0] !~# '^[[:alnum:]-]\+\.'
-    return fugitive#Config(FugitiveGitDir(a:000[0]))
+  if a:0 == 2 && type(a:2) != type({})
+    return fugitive#Config(a:1, FugitiveGitDir(a:2))
+  elseif a:0 == 1 && a:1 !~# '^[[:alnum:]-]\+\.'
+    return fugitive#Config(FugitiveGitDir(a:1))
   else
     return call('fugitive#Config', a:000)
   endif
@@ -256,6 +256,10 @@ augroup fugitive
         \   call fugitive#MapCfile() |
         \ endif
   autocmd FileType gitcommit
+        \ if exists('b:git_dir') |
+        \   call fugitive#MapCfile('fugitive#MessageCfile()') |
+        \ endif
+  autocmd FileType fugitive
         \ if exists('b:git_dir') |
         \   call fugitive#MapCfile('fugitive#StatusCfile()') |
         \ endif
